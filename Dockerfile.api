@@ -1,0 +1,14 @@
+FROM node:20-alpine
+WORKDIR /app
+
+# Install pg_isready so the container can wait for Postgres readiness
+RUN apk add --no-cache postgresql-client
+
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY server ./server
+COPY db.json ./db.json
+EXPOSE 3001
+
+# Wait for Postgres to become available, then start the API
+CMD sh -c 'until pg_isready -h ${DB_HOST:-db} -p ${DB_PORT:-5432} -U ${DB_USER:-postgres}; do echo "waiting for postgres"; sleep 1; done; node server/index.js'
