@@ -1,16 +1,73 @@
 import express from 'express'
 import cors from 'cors'
+import helmet from 'helmet'
+import morgan from 'morgan'
+import rateLimit from 'express-rate-limit'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
-import { pool, ensureSchema } from './db.js'
+import { pool, ensureSchema, seedIfEmpty } from './db.js'
 
-const app = express()
+const NODE_ENV = process.env.NODE_ENV || 'development'
+const isProd = NODE_ENV === 'production'
+
 const port = Number(process.env.PORT || 3001)
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret'
+const JWT_SECRET = process.env.JWT_SECRET || (isProd ? null : 'dev-secret')
+if (!JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET is required in production')
+  process.exit(1)
+}
 const TOKEN_TTL = '2h'
 
-app.use(cors())
-app.use(express.json())
+const allowedOriginsRaw = (process.env.ALLOWED_ORIGINS || '').trim()
+const allowedOrigins = allowedOriginsRaw
+  ? allowedOriginsRaw.split(',').map((s) => s.trim()).filter(Boolean)
+  : null // null => allow all (default for dev / same-origin behind nginx)
+
+const app = express()
+
+// Behind nginx — we need correct req.ip for rate limiter and logs
+const trustProxy = process.env.TRUST_PROXY ?? '1'
+app.set('trust proxy', Number.isFinite(Number(trustProxy)) ? Number(trustProxy) : trustProxy === 'true')
+
+app.use(helmet({
+  // The API is consumed by the SPA from the same origin via nginx,
+  // so we don't need CSP here (nginx adds headers for the HTML).
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'same-site' },
+}))
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!allowedOrigins) return cb(null, true)
+    if (!origin) return cb(null, true) // same-origin / curl
+    if (allowedOrigins.includes(origin)) return cb(null, true)
+    return cb(new Error('Not allowed by CORS'))
+  },
+  credentials: false,
+}))
+
+app.use(express.json({ limit: '100kb' }))
+
+app.use(morgan(isProd ? 'combined' : 'dev', {
+  skip: (req) => req.path === '/api/health',
+}))
+
+// Tighter rate limit for auth endpoints — mitigates credential stuffing
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many attempts, please try again later' },
+})
+
+// Looser limiter for mutating endpoints
+const writeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+})
 
 const requiredFields = ['name', 'type', 'severity', 'status', 'lastCheck', 'description']
 
@@ -171,11 +228,22 @@ function authenticate(req, res, next) {
   }
 }
 
+// Liveness — process is up
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' })
+  res.json({ status: 'ok', uptime: process.uptime() })
 })
 
-app.post('/api/auth/register', async (req, res, next) => {
+// Readiness — DB is reachable too
+app.get('/api/ready', async (req, res) => {
+  try {
+    await pool.query('SELECT 1')
+    res.json({ status: 'ready' })
+  } catch (error) {
+    res.status(503).json({ status: 'unavailable', error: error.message })
+  }
+})
+
+app.post('/api/auth/register', authLimiter, async (req, res, next) => {
   const { error, value } = validateRegisterPayload(req.body)
   if (error) {
     res.status(400).json({ error })
@@ -208,7 +276,7 @@ app.post('/api/auth/register', async (req, res, next) => {
   }
 })
 
-app.post('/api/auth/login', async (req, res, next) => {
+app.post('/api/auth/login', authLimiter, async (req, res, next) => {
   const { error, value } = validateLoginPayload(req.body)
   if (error) {
     res.status(400).json({ error })
@@ -279,7 +347,7 @@ app.get('/api/infrastructures/:id', async (req, res, next) => {
   }
 })
 
-app.post('/api/infrastructures', authenticate, async (req, res, next) => {
+app.post('/api/infrastructures', writeLimiter, authenticate, async (req, res, next) => {
   const { error, value } = validatePayload(req.body)
   if (error) {
     res.status(400).json({ error })
@@ -309,7 +377,7 @@ app.post('/api/infrastructures', authenticate, async (req, res, next) => {
   }
 })
 
-app.put('/api/infrastructures/:id', authenticate, async (req, res, next) => {
+app.put('/api/infrastructures/:id', writeLimiter, authenticate, async (req, res, next) => {
   const id = Number(req.params.id)
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: 'Invalid id' })
@@ -361,7 +429,7 @@ app.put('/api/infrastructures/:id', authenticate, async (req, res, next) => {
   }
 })
 
-app.delete('/api/infrastructures/:id', authenticate, async (req, res, next) => {
+app.delete('/api/infrastructures/:id', writeLimiter, authenticate, async (req, res, next) => {
   const id = Number(req.params.id)
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: 'Invalid id' })
@@ -380,13 +448,52 @@ app.delete('/api/infrastructures/:id', authenticate, async (req, res, next) => {
   }
 })
 
-app.use((error, req, res, next) => {
-  console.error(error)
-  res.status(500).json({ error: 'Internal server error' })
+// 404 for unknown /api/* — keep SPA fallback as nginx's job
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'Not found' })
 })
 
-await ensureSchema()
+// Error handler — never leak stack traces in prod
+app.use((error, req, res, next) => {
+  console.error('[api error]', error)
+  res.status(error.status || 500).json({
+    error: isProd ? 'Internal server error' : (error.message || 'Internal server error'),
+  })
+})
 
-app.listen(port, () => {
-  console.log(`API listening on port ${port}`)
+async function start() {
+  await ensureSchema()
+  if ((process.env.AUTO_SEED ?? 'true') === 'true') {
+    try {
+      const inserted = await seedIfEmpty()
+      if (inserted > 0) console.log(`[seed] inserted ${inserted} infrastructures`)
+    } catch (error) {
+      console.error('[seed] failed:', error.message)
+      // not fatal — the table just stays empty
+    }
+  }
+
+  const server = app.listen(port, () => {
+    console.log(`[api] listening on :${port} (${NODE_ENV})`)
+  })
+
+  // Graceful shutdown so docker stop / systemctl stop don't drop in-flight requests
+  const shutdown = async (signal) => {
+    console.log(`[api] received ${signal}, shutting down`)
+    server.close(async () => {
+      try { await pool.end() } catch {}
+      process.exit(0)
+    })
+    setTimeout(() => {
+      console.error('[api] force exit after 10s')
+      process.exit(1)
+    }, 10_000).unref()
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
+  process.on('SIGINT', () => shutdown('SIGINT'))
+}
+
+start().catch((error) => {
+  console.error('[api] failed to start:', error)
+  process.exit(1)
 })

@@ -3,18 +3,21 @@ services:
     image: postgres:15-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: infrastructure_safety
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      POSTGRES_DB: ${DB_NAME:-infrastructure_safety}
     volumes:
       - db_data:/var/lib/postgresql/data
+    # Bind Postgres only to loopback on the host — never expose to the public network.
+    # Comment this block out entirely if you don't need host access at all.
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-infrastructure_safety}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
 
   api:
     build:
@@ -22,16 +25,25 @@ services:
       dockerfile: Dockerfile.api
     restart: unless-stopped
     environment:
+      NODE_ENV: production
       PORT: 3001
-      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${DB_USER:-postgres}:${DB_PASSWORD}@db:5432/${DB_NAME:-infrastructure_safety}}
       DB_SSL: ${DB_SSL:-false}
-      JWT_SECRET: ${JWT_SECRET}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      AUTO_SEED: ${AUTO_SEED:-true}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     expose:
       - "3001"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   web:
     build:
@@ -39,10 +51,16 @@ services:
       dockerfile: Dockerfile.web
     restart: unless-stopped
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     ports:
       - "${WEB_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   db_data:
-
-
