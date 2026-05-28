@@ -27,7 +27,16 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3001
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${DB_USER:-postgres}:${DB_PASSWORD}@db:5432/${DB_NAME:-infrastructure_safety}}
+      # Two ways to point the API at Postgres — pick ONE in .env:
+      #   A) DATABASE_URL=postgresql://user:pass@host:5432/db   (takes priority)
+      #   B) DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME        (used when DATABASE_URL is empty)
+      # Inside compose the Postgres container is reachable as host "db".
+      DATABASE_URL: ${DATABASE_URL:-}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_NAME: ${DB_NAME:-infrastructure_safety}
       DB_SSL: ${DB_SSL:-false}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}

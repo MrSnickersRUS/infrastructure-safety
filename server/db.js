@@ -6,7 +6,9 @@ import fs from 'fs/promises'
 const sslEnabled = process.env.DB_SSL === 'true'
 const ssl = sslEnabled ? { rejectUnauthorized: false } : undefined
 
-const connectionString = process.env.DATABASE_URL
+// Treat an empty DATABASE_URL the same as "unset" — otherwise docker-compose's
+// `DATABASE_URL: ${DATABASE_URL:-}` would short-circuit the DB_HOST/... path.
+const connectionString = (process.env.DATABASE_URL || '').trim() || null
 
 const pool = new Pool(
   connectionString
