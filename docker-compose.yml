@@ -8,10 +8,13 @@ services:
       POSTGRES_DB: ${DB_NAME:-infrastructure_safety}
     volumes:
       - db_data:/var/lib/postgresql/data
-    # Bind Postgres only to loopback on the host — never expose to the public network.
-    # Comment this block out entirely if you don't need host access at all.
-    ports:
-      - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
+    # Postgres is only needed by the `api` container — they share the compose
+    # network and reach each other via the hostname `db`. Do NOT publish the
+    # port to the host unless you really need a psql/pgAdmin from outside.
+    # If you do, uncomment the block below; bind to loopback only:
+    #
+    # ports:
+    #   - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-infrastructure_safety}"]
       interval: 5s
